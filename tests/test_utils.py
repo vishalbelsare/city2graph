@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import rustworkx as rx
+import shapely.errors
 from shapely.geometry import LineString
 from shapely.geometry import MultiLineString
 from shapely.geometry import Point
@@ -223,6 +224,261 @@ class TestTessellation(BaseGraphTest):
         assert list(result.columns) == ["geometry", "enclosure_index", "tess_id"]
         assert "returning empty GeoDataFrame" in caplog.text
 
+    def test_enclosed_tessellation_retries_without_simplify_on_geometry_type_error(
+        self,
+        sample_buildings_gdf: gpd.GeoDataFrame,
+        sample_segments_gdf: gpd.GeoDataFrame,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A coverage_simplify TypeError should trigger a retry with simplify=False."""
+        monkeypatch.setattr(
+            momepy,
+            "enclosures",
+            lambda **_kwargs: gpd.GeoDataFrame(
+                {"eID": [1]},
+                geometry=[Polygon([(0, 0), (5, 0), (5, 5), (0, 5)])],
+                crs=sample_buildings_gdf.crs,
+            ),
+        )
+
+        calls: list[object] = []
+
+        def fake_enclosed_tessellation(**kwargs: object) -> gpd.GeoDataFrame:
+            calls.append(kwargs.get("simplify"))
+            if kwargs.get("simplify") is not False:
+                msg = "One of the Geometry inputs is of incorrect geometry type."
+                raise TypeError(msg)
+            return gpd.GeoDataFrame(
+                {"enclosure_index": [1]},
+                geometry=[Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])],
+                index=[0],
+                crs=sample_buildings_gdf.crs,
+            )
+
+        monkeypatch.setattr(momepy, "enclosed_tessellation", fake_enclosed_tessellation)
+
+        with caplog.at_level("WARNING"):
+            result = utils.create_tessellation(
+                sample_buildings_gdf,
+                primary_barriers=sample_segments_gdf,
+            )
+
+        assert not result.empty
+        assert "tess_id" in result.columns
+        assert calls[-1] is False  # retried with simplify=False
+        assert "retrying with simplify=False" in caplog.text
+
+    def test_enclosed_tessellation_reraises_unrelated_type_error(
+        self,
+        sample_buildings_gdf: gpd.GeoDataFrame,
+        sample_segments_gdf: gpd.GeoDataFrame,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A TypeError unrelated to coverage_simplify should propagate."""
+        monkeypatch.setattr(
+            momepy,
+            "enclosures",
+            lambda **_kwargs: gpd.GeoDataFrame(
+                {"eID": [1]},
+                geometry=[Polygon([(0, 0), (5, 0), (5, 5), (0, 5)])],
+                crs=sample_buildings_gdf.crs,
+            ),
+        )
+
+        def raise_unrelated(**_kwargs: object) -> gpd.GeoDataFrame:
+            msg = "something else entirely"
+            raise TypeError(msg)
+
+        monkeypatch.setattr(momepy, "enclosed_tessellation", raise_unrelated)
+
+        with pytest.raises(TypeError, match="something else entirely"):
+            utils.create_tessellation(
+                sample_buildings_gdf,
+                primary_barriers=sample_segments_gdf,
+            )
+
+    def test_enclosed_tessellation_retries_with_coarser_grid_size_on_geos_error(
+        self,
+        sample_buildings_gdf: gpd.GeoDataFrame,
+        sample_segments_gdf: gpd.GeoDataFrame,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A GEOS topology error should trigger a retry with a coarser grid_size."""
+        monkeypatch.setattr(
+            momepy,
+            "enclosures",
+            lambda **_kwargs: gpd.GeoDataFrame(
+                {"eID": [1]},
+                geometry=[Polygon([(0, 0), (5, 0), (5, 5), (0, 5)])],
+                crs=sample_buildings_gdf.crs,
+            ),
+        )
+
+        calls: list[object] = []
+
+        def fake_enclosed_tessellation(**kwargs: object) -> gpd.GeoDataFrame:
+            calls.append(kwargs.get("grid_size"))
+            if kwargs.get("grid_size") is None:
+                msg = "TopologyException: side location conflict at 0 0"
+                raise shapely.errors.GEOSException(msg)
+            return gpd.GeoDataFrame(
+                {"enclosure_index": [1]},
+                geometry=[Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])],
+                index=[0],
+                crs=sample_buildings_gdf.crs,
+            )
+
+        monkeypatch.setattr(momepy, "enclosed_tessellation", fake_enclosed_tessellation)
+
+        with caplog.at_level("WARNING"):
+            result = utils.create_tessellation(
+                sample_buildings_gdf,
+                primary_barriers=sample_segments_gdf,
+            )
+
+        assert not result.empty
+        assert "tess_id" in result.columns
+        assert calls[-1] == 1e-3  # retried with coarser grid_size
+        assert "retrying with coarser" in caplog.text
+
+    def test_enclosed_tessellation_returns_empty_when_geos_error_persists(
+        self,
+        sample_buildings_gdf: gpd.GeoDataFrame,
+        sample_segments_gdf: gpd.GeoDataFrame,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A GEOS error that persists at coarser precision degrades to empty output."""
+        monkeypatch.setattr(
+            momepy,
+            "enclosures",
+            lambda **_kwargs: gpd.GeoDataFrame(
+                {"eID": [1]},
+                geometry=[Polygon([(0, 0), (5, 0), (5, 5), (0, 5)])],
+                crs=sample_buildings_gdf.crs,
+            ),
+        )
+
+        def always_raise(**_kwargs: object) -> gpd.GeoDataFrame:
+            msg = "TopologyException: side location conflict at 0 0"
+            raise shapely.errors.GEOSException(msg)
+
+        monkeypatch.setattr(momepy, "enclosed_tessellation", always_raise)
+
+        with caplog.at_level("WARNING"):
+            result = utils.create_tessellation(
+                sample_buildings_gdf,
+                primary_barriers=sample_segments_gdf,
+            )
+
+        assert result.empty
+        assert "returning empty" in caplog.text
+
+    def test_enclosed_tessellation_reraises_geos_error_with_explicit_grid_size(
+        self,
+        sample_buildings_gdf: gpd.GeoDataFrame,
+        sample_segments_gdf: gpd.GeoDataFrame,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the caller pins grid_size, a GEOS error must propagate unchanged."""
+        monkeypatch.setattr(
+            momepy,
+            "enclosures",
+            lambda **_kwargs: gpd.GeoDataFrame(
+                {"eID": [1]},
+                geometry=[Polygon([(0, 0), (5, 0), (5, 5), (0, 5)])],
+                crs=sample_buildings_gdf.crs,
+            ),
+        )
+
+        def raise_geos(**_kwargs: object) -> gpd.GeoDataFrame:
+            msg = "TopologyException: side location conflict at 0 0"
+            raise shapely.errors.GEOSException(msg)
+
+        monkeypatch.setattr(momepy, "enclosed_tessellation", raise_geos)
+
+        with pytest.raises(shapely.errors.GEOSException, match="side location conflict"):
+            utils.create_tessellation(
+                sample_buildings_gdf,
+                primary_barriers=sample_segments_gdf,
+                grid_size=1e-5,
+            )
+
+    def test_enclosed_tessellation_passes_explicit_limit(
+        self,
+        sample_buildings_gdf: gpd.GeoDataFrame,
+        sample_segments_gdf: gpd.GeoDataFrame,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Explicit enclosure limits should be forwarded to momepy.enclosures."""
+        custom_limit = Polygon([(-10, -10), (10, -10), (10, 10), (-10, 10)])
+        captured: dict[str, object] = {}
+
+        def fake_enclosures(**kwargs: object) -> gpd.GeoDataFrame:
+            captured["limit"] = kwargs["limit"]
+            return gpd.GeoDataFrame(
+                {"eID": [1]},
+                geometry=[custom_limit],
+                crs=sample_buildings_gdf.crs,
+            )
+
+        def fake_enclosed_tessellation(**_kwargs: object) -> gpd.GeoDataFrame:
+            return gpd.GeoDataFrame(
+                {"enclosure_index": [1]},
+                geometry=[sample_buildings_gdf.geometry.iloc[0]],
+                crs=sample_buildings_gdf.crs,
+            )
+
+        monkeypatch.setattr(momepy, "enclosures", fake_enclosures)
+        monkeypatch.setattr(momepy, "enclosed_tessellation", fake_enclosed_tessellation)
+
+        result = utils.create_tessellation(
+            sample_buildings_gdf,
+            primary_barriers=sample_segments_gdf,
+            limit=custom_limit,
+        )
+
+        assert captured["limit"] is custom_limit
+        assert not result.empty
+
+    def test_enclosed_tessellation_computes_default_limit(
+        self,
+        sample_buildings_gdf: gpd.GeoDataFrame,
+        sample_segments_gdf: gpd.GeoDataFrame,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A non-empty buffered hull limit should be computed when none is supplied."""
+        captured: dict[str, object] = {}
+
+        def fake_enclosures(**kwargs: object) -> gpd.GeoDataFrame:
+            captured["limit"] = kwargs["limit"]
+            return gpd.GeoDataFrame(
+                {"eID": [1]},
+                geometry=[kwargs["limit"]],
+                crs=sample_buildings_gdf.crs,
+            )
+
+        def fake_enclosed_tessellation(**_kwargs: object) -> gpd.GeoDataFrame:
+            return gpd.GeoDataFrame(
+                {"enclosure_index": [1]},
+                geometry=[sample_buildings_gdf.geometry.iloc[0]],
+                crs=sample_buildings_gdf.crs,
+            )
+
+        monkeypatch.setattr(momepy, "enclosures", fake_enclosures)
+        monkeypatch.setattr(momepy, "enclosed_tessellation", fake_enclosed_tessellation)
+
+        result = utils.create_tessellation(
+            sample_buildings_gdf, primary_barriers=sample_segments_gdf
+        )
+
+        limit = captured["limit"]
+        assert isinstance(limit, Polygon)
+        assert not limit.is_empty
+        assert not result.empty
+
 
 # ============================================================================
 # GRAPH STRUCTURE TESTS
@@ -425,6 +681,87 @@ class TestGraphStructures(BaseGraphTest):
         edge_keys = edges_gdf.index.get_level_values("edge_key")
         assert list(edge_keys) == [0, 1]
 
+    def test_segments_to_graph_default_is_multigraph(
+        self,
+        sample_segments_gdf: gpd.GeoDataFrame,
+    ) -> None:
+        """The default output carries a three-level multigraph index."""
+        _, edges_gdf = morphology.segments_to_graph(sample_segments_gdf)
+        assert edges_gdf.index.names == ["from_node_id", "to_node_id", "edge_key"]
+
+    def test_segments_to_graph_multigraph_false_duplicates_raise(
+        self,
+        duplicate_segments_gdf: gpd.GeoDataFrame,
+    ) -> None:
+        """multigraph=False raises on duplicate node pairs instead of passing silently."""
+        with pytest.raises(ValueError, match=r"1 duplicate node pair\(s\)"):
+            morphology.segments_to_graph(duplicate_segments_gdf, multigraph=False)
+
+    def test_segments_to_graph_directed_default_preserves_draw_order(
+        self,
+        sample_crs: str,
+    ) -> None:
+        """Default directed=True keeps reverse-drawn segments as reciprocal pairs."""
+        segments = gpd.GeoDataFrame(
+            {"name": ["fwd", "rev"]},
+            geometry=[
+                LineString([(0, 0), (1, 1)]),
+                LineString([(1, 1), (0, 0)]),
+            ],
+            crs=sample_crs,
+        )
+        _, edges_gdf = morphology.segments_to_graph(segments)
+
+        pairs = list(
+            zip(
+                edges_gdf.index.get_level_values("from_node_id"),
+                edges_gdf.index.get_level_values("to_node_id"),
+                strict=True,
+            )
+        )
+        assert pairs == [(0, 1), (1, 0)]
+
+    def test_segments_to_graph_undirected_canonicalizes_reverse_segments(
+        self,
+        sample_crs: str,
+    ) -> None:
+        """directed=False folds reverse-drawn segments into one unordered pair."""
+        segments = gpd.GeoDataFrame(
+            {"name": ["fwd", "rev"]},
+            geometry=[
+                LineString([(0, 0), (1, 1)]),
+                LineString([(1, 1), (0, 0)]),
+            ],
+            crs=sample_crs,
+        )
+        _, edges_gdf = morphology.segments_to_graph(segments, directed=False)
+
+        assert edges_gdf.index.tolist() == [(0, 1, 0), (0, 1, 1)]
+        # Geometries are left unchanged; only the index order is normalized.
+        assert list(edges_gdf.geometry) == list(segments.geometry)
+
+    def test_segments_to_graph_empty_as_nx(
+        self,
+        empty_gdf: gpd.GeoDataFrame,
+    ) -> None:
+        """Empty input honors as_nx=True instead of returning a tuple."""
+        result = morphology.segments_to_graph(empty_gdf, as_nx=True)
+        assert isinstance(result, nx.MultiGraph)
+        assert result.number_of_nodes() == 0
+
+        simple = morphology.segments_to_graph(empty_gdf, multigraph=False, as_nx=True)
+        assert isinstance(simple, nx.Graph)
+        assert not isinstance(simple, nx.MultiGraph)
+
+    def test_segments_to_graph_as_nx_keeps_parallel_edges(
+        self,
+        duplicate_segments_gdf: gpd.GeoDataFrame,
+    ) -> None:
+        """as_nx=True with the multigraph default preserves parallel edges."""
+        graph = morphology.segments_to_graph(duplicate_segments_gdf, as_nx=True)
+        assert isinstance(graph, nx.MultiGraph)
+        assert graph.number_of_edges() == 2
+
     def test_dual_graph_empty_result_with_edge_id_col(
         self, sample_nodes_gdf: gpd.GeoDataFrame, sample_crs: str
     ) -> None:
@@ -458,6 +795,223 @@ class TestGraphStructures(BaseGraphTest):
         """Test _canonical_edge_pair with self-loop (line 1370)."""
         assert utils._canonical_edge_pair(1, 1) == (1, 1)
         assert utils._canonical_edge_pair("a", "a") == ("a", "a")
+
+
+# ============================================================================
+# EDGE CANONICALIZATION TESTS
+# ============================================================================
+
+
+class TestCanonicalizeEdges(BaseGraphTest):
+    """Test canonicalize_edges collapsing of reciprocal and parallel rows."""
+
+    @staticmethod
+    def _make_edges(
+        tuples: list[tuple[Any, ...]],
+        names: list[str] | None = None,
+    ) -> gpd.GeoDataFrame:
+        """Build an edge GeoDataFrame with one distinct row per index tuple."""
+        if names is None:
+            names = ["u", "v"] if len(tuples[0]) == 2 else ["u", "v", "k"]
+        return gpd.GeoDataFrame(
+            {"name": [f"e{i}" for i in range(len(tuples))]},
+            geometry=[LineString([(i, 0), (i + 1, 1)]) for i in range(len(tuples))],
+            index=pd.MultiIndex.from_tuples(tuples, names=names),
+            crs="EPSG:27700",
+        )
+
+    def test_first_keeps_first_row_per_unordered_pair(self) -> None:
+        """duplicates='first' keeps the first reciprocal row verbatim."""
+        edges = self._make_edges([(0, 1), (1, 0), (1, 2)])
+        result = utils.canonicalize_edges(edges)
+
+        assert result.index.tolist() == [(0, 1), (1, 2)]
+        assert result.index.names == ["u", "v"]
+        assert list(result["name"]) == ["e0", "e2"]
+        assert result.geometry.iloc[0] == edges.geometry.iloc[0]
+        assert result.crs == edges.crs
+
+    def test_key_keeps_all_rows_as_multigraph(self) -> None:
+        """duplicates='key' keeps reciprocal rows under distinct keys."""
+        edges = self._make_edges([(0, 1), (1, 0), (1, 2)])
+        result = utils.canonicalize_edges(edges, duplicates="key")
+
+        assert result.index.tolist() == [(0, 1, 0), (0, 1, 1), (1, 2, 0)]
+        assert result.index.names == ["u", "v", "key"]
+        assert list(result["name"]) == ["e0", "e1", "e2"]
+
+    def test_error_reports_offending_pairs(self) -> None:
+        """duplicates='error' raises with row and pair counts."""
+        edges = self._make_edges([(0, 1), (1, 0)])
+        with pytest.raises(ValueError, match=r"2 row\(s\) across 1 unordered pair\(s\)"):
+            utils.canonicalize_edges(edges, duplicates="error")
+
+    def test_error_passes_when_no_duplicates(self) -> None:
+        """duplicates='error' returns canonicalized edges when keys are unique."""
+        edges = self._make_edges([(1, 0), (2, 1)])
+        result = utils.canonicalize_edges(edges, duplicates="error")
+        assert result.index.tolist() == [(0, 1), (1, 2)]
+
+    def test_three_level_input_preserves_distinct_keys(self) -> None:
+        """Three-level input keeps distinct parallel keys under 'first'."""
+        edges = self._make_edges([(1, 0, 0), (0, 1, 1), (1, 0, 1)])
+        result = utils.canonicalize_edges(edges)
+
+        # (1, 0, 1) duplicates (0, 1, 1) after canonicalization and is dropped.
+        assert result.index.tolist() == [(0, 1, 0), (0, 1, 1)]
+        assert result.index.names == ["u", "v", "k"]
+
+    def test_three_level_input_regenerates_keys(self) -> None:
+        """duplicates='key' regenerates keys per unordered pair."""
+        edges = self._make_edges([(1, 0, 0), (0, 1, 0)])
+        result = utils.canonicalize_edges(edges, duplicates="key")
+        assert result.index.tolist() == [(0, 1, 0), (0, 1, 1)]
+        assert result.index.names == ["u", "v", "k"]
+
+    def test_self_loops_unchanged(self) -> None:
+        """Self-loops keep their index values."""
+        edges = self._make_edges([(2, 2), (1, 0)])
+        result = utils.canonicalize_edges(edges)
+        assert result.index.tolist() == [(2, 2), (0, 1)]
+
+    def test_string_ids_sorted(self) -> None:
+        """String identifiers are ordered lexicographically."""
+        edges = self._make_edges([("b", "a")])
+        result = utils.canonicalize_edges(edges)
+        assert result.index.tolist() == [("a", "b")]
+
+    def test_mixed_type_ids_use_factorize_fallback(self) -> None:
+        """Non-comparable mixed-type identifiers fall back to appearance order."""
+        edges = self._make_edges([("a", 1), (1, "a")])
+        result = utils.canonicalize_edges(edges)
+        assert result.index.tolist() == [("a", 1)]
+
+    def test_empty_input_returns_copy(self) -> None:
+        """An empty edge GeoDataFrame is returned unchanged."""
+        edges = gpd.GeoDataFrame(
+            {"name": []},
+            geometry=[],
+            index=pd.MultiIndex.from_arrays([[], []], names=["u", "v"]),
+            crs="EPSG:27700",
+        )
+        result = utils.canonicalize_edges(edges)
+        assert result.empty
+        assert result is not edges
+
+    def test_non_multiindex_raises(self) -> None:
+        """A flat index is rejected."""
+        edges = gpd.GeoDataFrame(
+            {"name": ["e0"]},
+            geometry=[LineString([(0, 0), (1, 1)])],
+            crs="EPSG:27700",
+        )
+        with pytest.raises(ValueError, match="MultiIndex with at least"):
+            utils.canonicalize_edges(edges)
+
+    def test_invalid_duplicates_option_raises(self) -> None:
+        """Unknown duplicates options are rejected."""
+        edges = self._make_edges([(0, 1)])
+        with pytest.raises(ValueError, match="duplicates must be one of"):
+            utils.canonicalize_edges(edges, duplicates="drop")  # type: ignore[arg-type]
+
+
+class TestSymmetrizeEdges(BaseGraphTest):
+    """Test symmetrize_edges adding reverse rows of undirected edges."""
+
+    @staticmethod
+    def _make_edges(
+        tuples: list[tuple[Any, ...]],
+        names: list[str] | None = None,
+    ) -> gpd.GeoDataFrame:
+        """Build an edge GeoDataFrame with one distinct row per index tuple."""
+        if names is None:
+            names = ["u", "v"] if len(tuples[0]) == 2 else ["u", "v", "k"]
+        return gpd.GeoDataFrame(
+            {"name": [f"e{i}" for i in range(len(tuples))]},
+            geometry=[LineString([(i, 0), (i + 1, 1)]) for i in range(len(tuples))],
+            index=pd.MultiIndex.from_tuples(tuples, names=names),
+            crs="EPSG:27700",
+        )
+
+    def test_adds_reverse_rows(self) -> None:
+        """Each canonical edge gains a reverse row with copied attributes."""
+        edges = self._make_edges([(0, 1), (1, 2)])
+        result = utils.symmetrize_edges(edges)
+
+        assert result.index.tolist() == [(0, 1), (1, 2), (1, 0), (2, 1)]
+        assert result.index.names == ["u", "v"]
+        assert list(result["name"]) == ["e0", "e1", "e0", "e1"]
+        assert result.crs == edges.crs
+
+    def test_reverse_rows_have_reversed_geometry(self) -> None:
+        """Reverse rows reverse the LineString so it starts at the source node."""
+        edges = self._make_edges([(0, 1)])
+        result = utils.symmetrize_edges(edges)
+
+        forward = list(result.geometry.loc[(0, 1)].coords)
+        backward = list(result.geometry.loc[(1, 0)].coords)
+        assert backward == forward[::-1]
+
+    def test_self_loops_not_duplicated(self) -> None:
+        """Self-loops appear only once in the output."""
+        edges = self._make_edges([(2, 2), (0, 1)])
+        result = utils.symmetrize_edges(edges)
+        assert result.index.tolist() == [(2, 2), (0, 1), (1, 0)]
+
+    def test_idempotent(self) -> None:
+        """Applying symmetrize_edges twice equals applying it once."""
+        edges = self._make_edges([(0, 1), (1, 2)])
+        once = utils.symmetrize_edges(edges)
+        twice = utils.symmetrize_edges(once)
+        assert twice.equals(once)
+
+    def test_already_bidirectional_input_unchanged(self) -> None:
+        """Inputs already holding both directions gain no extra rows."""
+        edges = self._make_edges([(0, 1), (1, 0)])
+        result = utils.symmetrize_edges(edges)
+        assert result.index.tolist() == [(0, 1), (1, 0)]
+        assert list(result["name"]) == ["e0", "e1"]
+
+    def test_three_level_index_keeps_keys(self) -> None:
+        """Multigraph keys are preserved on reverse rows."""
+        edges = self._make_edges([(0, 1, 0), (0, 1, 1)])
+        result = utils.symmetrize_edges(edges)
+        assert result.index.tolist() == [(0, 1, 0), (0, 1, 1), (1, 0, 0), (1, 0, 1)]
+        assert result.index.names == ["u", "v", "k"]
+
+    def test_round_trip_with_canonicalize(self) -> None:
+        """canonicalize_edges collapses symmetrized output back to the input."""
+        edges = self._make_edges([(0, 1), (1, 2)])
+        result = utils.canonicalize_edges(utils.symmetrize_edges(edges))
+        assert result.equals(edges)
+
+    def test_mixed_type_ids_supported(self) -> None:
+        """Mixed, non-comparable identifier types are symmetrized verbatim."""
+        edges = self._make_edges([("a", 1)])
+        result = utils.symmetrize_edges(edges)
+        assert result.index.tolist() == [("a", 1), (1, "a")]
+
+    def test_empty_input_returns_copy(self) -> None:
+        """An empty edge GeoDataFrame is returned unchanged."""
+        edges = gpd.GeoDataFrame(
+            {"name": []},
+            geometry=[],
+            index=pd.MultiIndex.from_arrays([[], []], names=["u", "v"]),
+            crs="EPSG:27700",
+        )
+        result = utils.symmetrize_edges(edges)
+        assert result.empty
+        assert result is not edges
+
+    def test_non_multiindex_raises(self) -> None:
+        """A flat index is rejected."""
+        edges = gpd.GeoDataFrame(
+            {"name": ["e0"]},
+            geometry=[LineString([(0, 0), (1, 1)])],
+            crs="EPSG:27700",
+        )
+        with pytest.raises(ValueError, match="MultiIndex with at least"):
+            utils.symmetrize_edges(edges)
 
 
 # ============================================================================

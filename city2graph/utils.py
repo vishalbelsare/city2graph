@@ -38,6 +38,7 @@ from shapely.geometry import MultiPoint
 from shapely.geometry import MultiPolygon
 from shapely.geometry import Point
 from shapely.geometry import Polygon
+from shapely.geometry.base import BaseGeometry
 
 try:
     import matplotlib.pyplot as plt
@@ -57,6 +58,7 @@ from .base import GraphMetadata
 
 # Public API definition
 __all__ = [
+    "canonicalize_edges",
     "clip_graph",
     "create_isochrone",
     "create_tessellation",
@@ -68,6 +70,7 @@ __all__ = [
     "plot_graph",
     "remove_isolated_components",
     "rx_to_nx",
+    "symmetrize_edges",
     "validate_gdf",
     "validate_nx",
 ]
@@ -1876,6 +1879,249 @@ def dual_graph(
     if as_nx:
         return gdf_to_nx(dual_nodes, dual_edges)
     return dual_nodes, dual_edges
+
+
+def canonicalize_edges(
+    edges: gpd.GeoDataFrame,
+    duplicates: Literal["first", "key", "error"] = "first",
+) -> gpd.GeoDataFrame:
+    """
+    Canonicalize an edge GeoDataFrame to one deterministic row per undirected pair.
+
+    Reorders the first two MultiIndex levels (source, target) of every
+    non-self-loop edge into a deterministic canonical order, so reciprocal rows
+    ``(u, v)`` and ``(v, u)`` — the typical shape of bidirectional roads exported
+    from a directed source such as an OSMnx MultiDiGraph — map onto the same
+    unordered key. Attributes and geometry of each row are left untouched; only
+    the index values change (geometries are NOT reversed). Self-loops are
+    returned unchanged.
+
+    Rows that share the same unordered key after canonicalization are handled
+    according to ``duplicates``.
+
+    Parameters
+    ----------
+    edges : geopandas.GeoDataFrame
+        Edge GeoDataFrame with a two-level (source, target) or three-level
+        (source, target, key) MultiIndex. For heterogeneous graphs, call this
+        function separately on each edge type's GeoDataFrame.
+    duplicates : {"first", "key", "error"}, default "first"
+        How to handle rows sharing the same unordered key after
+        canonicalization:
+
+        - ``"first"``: keep the first occurrence and drop the rest. For
+          three-level input the key level participates in the comparison, so
+          distinct parallel keys are preserved.
+        - ``"key"``: keep all rows and (re)generate an integer key level per
+          unordered pair, producing a valid three-level multigraph index.
+        - ``"error"``: raise ``ValueError`` reporting the offending pairs.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        The canonicalized edge GeoDataFrame. Row order, columns, attributes,
+        geometry, and CRS are preserved (apart from rows dropped by
+        ``duplicates="first"``). Index level names are kept positionally:
+        level 0 keeps its original name even where values were swapped.
+
+    Raises
+    ------
+    ValueError
+        If the index is not a MultiIndex with at least two levels, if
+        ``duplicates`` is not a recognized option, or if duplicate unordered
+        keys remain and ``duplicates="error"``.
+
+    See Also
+    --------
+    symmetrize_edges : Inverse operation adding the reverse row of each edge.
+    gdf_to_pyg : Convert GeoDataFrames to PyTorch Geometric objects.
+    segments_to_graph : Convert LineString segments to a graph structure.
+
+    Notes
+    -----
+    Node identifiers are ordered with a vectorized comparison when they are
+    mutually comparable (e.g. all integers or all strings). For mixed,
+    non-comparable identifier types the order falls back to first-appearance
+    codes, which is deterministic for a given input but input-dependent.
+
+    Examples
+    --------
+    >>> import geopandas as gpd
+    >>> import pandas as pd
+    >>> from shapely.geometry import LineString
+    >>> index = pd.MultiIndex.from_tuples([(0, 1), (1, 0)], names=["u", "v"])
+    >>> edges = gpd.GeoDataFrame(
+    ...     {"name": ["ab", "ba"]},
+    ...     geometry=[LineString([(0, 0), (1, 1)]), LineString([(1, 1), (0, 0)])],
+    ...     index=index,
+    ...     crs="EPSG:32633",
+    ... )
+    >>> canonicalize_edges(edges).index.tolist()
+    [(0, 1)]
+    >>> canonicalize_edges(edges, duplicates="key").index.tolist()
+    [(0, 1, 0), (0, 1, 1)]
+    """
+    allowed = ("first", "key", "error")
+    if duplicates not in allowed:
+        msg = f"duplicates must be one of {allowed}, got {duplicates!r}."
+        raise ValueError(msg)
+
+    if not isinstance(edges.index, pd.MultiIndex) or edges.index.nlevels < 2:
+        msg = (
+            "Edge GeoDataFrame index must be a MultiIndex with at least "
+            "two levels (source, target)."
+        )
+        raise ValueError(msg)
+
+    if edges.empty:
+        return edges.copy()
+
+    src = np.asarray(edges.index.get_level_values(0), dtype=object)
+    dst = np.asarray(edges.index.get_level_values(1), dtype=object)
+    try:
+        swap = src > dst
+    except TypeError:
+        # Mixed, non-comparable identifier types: order by first-appearance codes.
+        codes = pd.factorize(np.concatenate([src, dst]), sort=False)[0]
+        swap = codes[: len(src)] > codes[len(src) :]
+    canon_src = np.where(swap, dst, src)
+    canon_dst = np.where(swap, src, dst)
+
+    names = list(edges.index.names)
+    has_key_level = edges.index.nlevels >= 3
+    pairs = pd.DataFrame({"u": canon_src, "v": canon_dst})
+    if has_key_level:
+        pairs["key"] = np.asarray(edges.index.get_level_values(2), dtype=object)
+
+    result = edges.copy()
+
+    if duplicates == "key":
+        keys = pairs.groupby(["u", "v"], sort=False).cumcount().to_numpy()
+        key_name = names[2] if has_key_level else "key"
+        result.index = pd.MultiIndex.from_arrays(
+            [canon_src, canon_dst, keys],
+            names=[names[0], names[1], key_name],
+        )
+        return result
+
+    duplicated_mask = pairs.duplicated(keep=False).to_numpy()
+    if duplicates == "error" and duplicated_mask.any():
+        dup_pairs = pairs.loc[duplicated_mask, ["u", "v"]].drop_duplicates()
+        examples = ", ".join(f"({u}, {v})" for u, v in dup_pairs.head(3).itertuples(index=False))
+        msg = (
+            f"Duplicate undirected edges detected after canonicalization: "
+            f"{int(duplicated_mask.sum())} row(s) across {len(dup_pairs)} "
+            f"unordered pair(s), e.g. {examples}. Pass duplicates='first' to "
+            f"keep one row per pair or duplicates='key' to keep all rows as "
+            f"a multigraph."
+        )
+        raise ValueError(msg)
+
+    index_arrays = [canon_src, canon_dst]
+    if has_key_level:
+        index_arrays.append(np.asarray(edges.index.get_level_values(2), dtype=object))
+    result.index = pd.MultiIndex.from_arrays(index_arrays, names=names)
+    if duplicates == "first":
+        keep_mask = ~pairs.duplicated(keep="first").to_numpy()
+        result = result[keep_mask]
+    return result
+
+
+def symmetrize_edges(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Symmetrize an edge GeoDataFrame by adding the reverse row of each edge.
+
+    For every non-self-loop edge ``(u, v)`` whose reverse ``(v, u)`` is not
+    already present, appends a row indexed ``(v, u)`` with the same attributes
+    and a reversed geometry, so that each row's geometry starts at its source
+    node. This makes neighbourhood queries on the MultiIndex complete (e.g.
+    ``edges.xs(node, level=0)`` returns every neighbour of ``node``), at the
+    cost of duplicating edge attributes and geometries. Self-loops and edges
+    whose reverse already exists are left untouched, so the operation is
+    idempotent. Three-level (source, target, key) multigraph indexes keep the
+    key of the original row on the reverse row.
+
+    This is the inverse operation of :func:`canonicalize_edges`.
+
+    Parameters
+    ----------
+    edges : geopandas.GeoDataFrame
+        Edge GeoDataFrame with a two-level (source, target) or three-level
+        (source, target, key) MultiIndex. For heterogeneous graphs, call this
+        function separately on each edge type's GeoDataFrame.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        The symmetrized edge GeoDataFrame. Original rows come first with
+        columns, attributes, and CRS preserved; reverse rows are appended in
+        the order of the rows they mirror. Index level names are kept
+        positionally.
+
+    Raises
+    ------
+    ValueError
+        If the index is not a MultiIndex with at least two levels.
+
+    See Also
+    --------
+    canonicalize_edges : Inverse operation collapsing reciprocal rows.
+    gdf_to_pyg : Convert GeoDataFrames to PyTorch Geometric objects.
+
+    Notes
+    -----
+    ``gdf_to_pyg(..., directed=False)`` rejects edge tables containing both
+    ``(u, v)`` and ``(v, u)`` rows as ambiguous. Collapse a symmetrized table
+    with :func:`canonicalize_edges` first, or pass ``directed=True`` to keep
+    the reciprocal rows as directed edges.
+
+    Examples
+    --------
+    >>> import geopandas as gpd
+    >>> import pandas as pd
+    >>> from shapely.geometry import LineString
+    >>> index = pd.MultiIndex.from_tuples([(0, 1)], names=["u", "v"])
+    >>> edges = gpd.GeoDataFrame(
+    ...     {"name": ["ab"]},
+    ...     geometry=[LineString([(0, 0), (1, 1)])],
+    ...     index=index,
+    ...     crs="EPSG:32633",
+    ... )
+    >>> symmetrize_edges(edges).index.tolist()
+    [(0, 1), (1, 0)]
+    """
+    if not isinstance(edges.index, pd.MultiIndex) or edges.index.nlevels < 2:
+        msg = (
+            "Edge GeoDataFrame index must be a MultiIndex with at least "
+            "two levels (source, target)."
+        )
+        raise ValueError(msg)
+
+    if edges.empty:
+        return edges.copy()
+
+    src = np.asarray(edges.index.get_level_values(0), dtype=object)
+    dst = np.asarray(edges.index.get_level_values(1), dtype=object)
+    names = list(edges.index.names)
+
+    reversed_arrays = [dst, src]
+    reversed_arrays.extend(
+        np.asarray(edges.index.get_level_values(level), dtype=object)
+        for level in range(2, edges.index.nlevels)
+    )
+    reversed_index = pd.MultiIndex.from_arrays(reversed_arrays, names=names)
+
+    # Self-loops reverse onto themselves, so the membership test alone keeps
+    # them out of the appended rows.
+    missing = (src != dst) & ~reversed_index.isin(edges.index)
+    if not missing.any():
+        return edges.copy()
+
+    reverse_rows = edges[missing].copy()
+    reverse_rows.index = reversed_index[missing]
+    reverse_rows.geometry = reverse_rows.geometry.reverse()
+
+    return gpd.GeoDataFrame(pd.concat([edges, reverse_rows]))
 
 
 def _validate_dual_graph_input(
@@ -3923,6 +4169,7 @@ def create_tessellation(
     segment: float = 0.5,
     threshold: float = 0.05,
     n_jobs: int = -1,
+    limit: gpd.GeoDataFrame | gpd.GeoSeries | BaseGeometry | None = None,
     **kwargs: object,
 ) -> gpd.GeoDataFrame:
     """
@@ -3952,6 +4199,9 @@ def create_tessellation(
     n_jobs : int, default -1
         The number of jobs to use for parallel processing. -1 means using all
         available processors. Only used for enclosed tessellation.
+    limit : geopandas.GeoDataFrame, geopandas.GeoSeries, shapely geometry, or None, optional
+        Boundary passed to `momepy.enclosures` for enclosed tessellation. When
+        None, a buffered convex hull of input geometry and barriers is computed.
     **kwargs : object, optional
         Additional keyword arguments passed to the underlying `momepy`
         tessellation function.
@@ -4015,6 +4265,7 @@ def create_tessellation(
         return _create_enclosed_tessellation(
             geometry,
             primary_barriers,
+            limit,
             shrink,
             segment,
             threshold,
@@ -4032,6 +4283,7 @@ def create_tessellation(
 def _create_enclosed_tessellation(
     geometry: gpd.GeoDataFrame | gpd.GeoSeries,
     primary_barriers: gpd.GeoDataFrame | gpd.GeoSeries,
+    limit: gpd.GeoDataFrame | gpd.GeoSeries | BaseGeometry | None,
     shrink: float,
     segment: float,
     threshold: float,
@@ -4051,6 +4303,9 @@ def _create_enclosed_tessellation(
         The geometries to tessellate around.
     primary_barriers : geopandas.GeoDataFrame or geopandas.GeoSeries
         Geometries to use as barriers.
+    limit : geopandas.GeoDataFrame, geopandas.GeoSeries, shapely geometry, or None
+        Boundary passed to `momepy.enclosures`. If None, one is derived from
+        geometry and barriers.
     shrink : float
         The distance to shrink the geometry.
     segment : float
@@ -4067,25 +4322,34 @@ def _create_enclosed_tessellation(
     geopandas.GeoDataFrame
         The enclosed tessellation.
     """
+    if limit is None:
+        limit = _compute_enclosure_limit(geometry, primary_barriers)
+
     enclosures = momepy.enclosures(
         primary_barriers=primary_barriers,
-        limit=None,
+        limit=limit,
         additional_barriers=None,
         enclosure_id="eID",
         clip=False,
     )
 
     if not enclosures.empty:
-        try:
-            tessellation = momepy.enclosed_tessellation(
+
+        def _run_enclosed_tessellation(**extra_kwargs: object) -> gpd.GeoDataFrame:
+            # ``extra_kwargs`` (e.g. ``simplify`` or a coarser ``grid_size``) are
+            # applied as retry overrides on top of the caller-supplied ``kwargs``.
+            return momepy.enclosed_tessellation(
                 geometry=geometry,
                 enclosures=enclosures,
                 shrink=shrink,
                 segment=segment,
                 threshold=threshold,
                 n_jobs=n_jobs,
-                **kwargs,
+                **{**kwargs, **extra_kwargs},
             )
+
+        try:
+            tessellation = _run_enclosed_tessellation()
         except ValueError as e:
             if "No objects to concatenate" in str(e):
                 logger.warning(
@@ -4093,6 +4357,41 @@ def _create_enclosed_tessellation(
                 )
                 return _create_empty_tessellation(geometry.crs)
             raise
+        except TypeError as e:
+            # shapely.coverage_simplify rejects non-polygonal cells produced by
+            # degenerate/overlapping footprints in a single enclosure, which
+            # aborts the whole parallel run. Retry once without boundary
+            # simplification (the un-simplified result is still a valid
+            # tessellation) unless the caller explicitly chose ``simplify``.
+            if "incorrect geometry type" not in str(e) or "simplify" in kwargs:
+                raise
+            logger.warning(
+                "Tessellation boundary simplification failed (%s); retrying with simplify=False.",
+                e,
+            )
+            tessellation = _run_enclosed_tessellation(simplify=False)
+        except shapely.errors.GEOSException as e:
+            # ``shapely.voronoi_polygons`` can raise ``TopologyException: side
+            # location conflict`` on numerically fragile / near-degenerate
+            # footprints. ``voronoi_frames`` snaps coordinates at ``grid_size``
+            # (default 1e-5); a single failing enclosure aborts the whole parallel
+            # run. Retry once with a coarser precision to resolve the conflict,
+            # unless the caller already pinned ``grid_size``.
+            if "grid_size" in kwargs:
+                raise
+            logger.warning(
+                "Tessellation hit a GEOS topology error (%s); retrying with coarser "
+                "grid_size=1e-3.",
+                e,
+            )
+            try:
+                tessellation = _run_enclosed_tessellation(grid_size=1e-3)
+            except shapely.errors.GEOSException:
+                logger.warning(
+                    "Tessellation still failed at coarser precision; returning empty "
+                    "tessellation for this unit.",
+                )
+                return _create_empty_tessellation(geometry.crs, include_tess_id=False)
     else:
         tessellation = _create_empty_tessellation(geometry.crs, include_tess_id=False)
 
@@ -4104,6 +4403,44 @@ def _create_enclosed_tessellation(
         for i, j in zip(tessellation["enclosure_index"], tessellation.index, strict=False)
     ]
     return tessellation.reset_index(drop=True)
+
+
+def _compute_enclosure_limit(
+    geometry: gpd.GeoDataFrame | gpd.GeoSeries,
+    primary_barriers: gpd.GeoDataFrame | gpd.GeoSeries,
+    buffer: float = 500,
+) -> BaseGeometry | None:
+    """
+    Compute a buffered hull limit for momepy enclosures.
+
+    The limit needs to include both buildings and street barriers so buildings
+    near the outer street loops are not excluded from enclosed tessellation.
+
+    Parameters
+    ----------
+    geometry : gpd.GeoDataFrame | gpd.GeoSeries
+        Building geometries used to compute boundaries.
+    primary_barriers : gpd.GeoDataFrame | gpd.GeoSeries
+        Street geometries forming enclosures.
+    buffer : float, default 500
+        Distance in map units to buffer the combined convex hull.
+
+    Returns
+    -------
+    BaseGeometry | None
+        A single geometry representing the enclosure limit, or None if no valid
+        geometries exist.
+    """
+    geometries = [
+        geom
+        for source in (geometry.geometry, primary_barriers.geometry)
+        for geom in source
+        if geom is not None and not geom.is_empty
+    ]
+    if not geometries:
+        return None
+
+    return gpd.GeoSeries(geometries, crs=geometry.crs).union_all().convex_hull.buffer(buffer)
 
 
 def _create_empty_tessellation(
